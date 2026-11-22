@@ -1,0 +1,5 @@
+material_id,formula,polymorph,modification_type,dopant_element,dopant_atomic_pct,intercalant_ion,intercalant_stoich,evidence_status,molar_mass_g_mol,theoretical_cap_2e_mah_g,mean_electronegativity,electronegativity_spread,dopant_radius_strain_pct,effective_spacing_A,base_mn_o_bond_A,base_distortion_idx,base_band_gap_eV
+MNO2-ALPHA-PRISTINE-NONE-001,MnO2,alpha,pristine,,,,,both,86.937,616.57,2.81,1.89,0.0,4.6,1.8919393649542344,0.005399570972247481,1.1467
+MNO2-BETA-PRISTINE-NONE-001,MnO2,beta,pristine,,,,,both,86.937,616.57,2.81,1.89,0.0,2.3,1.8848457557319336,0.004577086432787144,0.0
+MNO2-GAMMA-PRISTINE-NONE-001,MnO2,gamma,pristine,,,,,both,86.937,616.57,2.81,1.89,0.0,3.45,1.8933982849781683,0.004695039056898881,0.0
+MNO2-DELTA-PRISTINE-NONE-001,YMoO4F,delta,pristine,,,,,both,267.842,200.13,3.0171,2.76,0.0,7.0,1.9026615327772651,1.076925114478471e-06,1.8708
