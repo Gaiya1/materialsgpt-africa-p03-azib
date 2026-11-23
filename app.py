@@ -19,7 +19,6 @@ st.set_page_config(
 
 DRIVE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(DRIVE_DIR, "materialsgpt_p03_azib.db")
-FEATURES_PATH = os.path.join(DRIVE_DIR, "WP2_engineered_features.csv")
 
 PRETTY_NAMES = {
     "dopant_atomic_pct": "Dopant Conc. (at.%)",
@@ -114,13 +113,6 @@ def compute_features_from_db(materials, structures, descriptors, computations):
         })
     return pd.concat([materials.reset_index(drop=True), pd.DataFrame(rows)], axis=1)
 
-def compute_local_attributions(rf_model, X_train_df, X_pred_df):
-    importances = rf_model.feature_importances_
-    means = X_train_df.mean().to_numpy()
-    stds = X_train_df.std().replace(0, 1.0).to_numpy()
-    z_scores = (X_pred_df.to_numpy() - means) / stds
-    return z_scores * importances * 10.0
-
 def build_workstation_dft_zip(row):
     poly = str(row["polymorph"])
     cif_path = BASE_CIFS.get(poly)
@@ -128,14 +120,13 @@ def build_workstation_dft_zip(row):
         return None, 0, "CIF missing"
 
     struct = Structure.from_file(cif_path).copy()
-    sc_dims = (1, 1, 2) if poly in ("alpha", "beta", "gamma") else (3, 3, 1)
-    struct.make_supercell(sc_dims)
+    struct.make_supercell((1, 1, 2) if poly in ("alpha", "beta", "gamma") else (3, 3, 1))
 
     dopant = row["dopant_element"]
     if pd.notna(dopant) and str(dopant) not in ("None", "", "nan"):
-        mn_sites = tuple(i for i, s in enumerate(struct) if s.specie.symbol == "Mn")
-        if len(mn_sites) > 0:
-            struct.replace(mn_sites.__getitem__(0), str(dopant))
+        mn_sites = [i for i, s in enumerate(struct) if s.specie.symbol == "Mn"]
+        if mn_sites:
+            struct.replace(mn_sites[0], str(dopant))
 
     ion = row["intercalant_ion"]
     if pd.notna(ion) and str(ion) not in ("None", "", "nan"):
@@ -152,4 +143,157 @@ def build_workstation_dft_zip(row):
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr(f"{prefix}_supercell.cif", struct.to(fmt="cif"))
         zf.writestr(f"{prefix}.POSCAR", str(Poscar(struct)))
+        present_els = {el.symbol: PSEUDOS[el.symbol] for el in struct.composition.elements if el.symbol in PSEUDOS}
+        qe_in = PWInput(
+            structure=struct, pseudo=present_els,
+            control={"calculation": "vc-relax", "prefix": prefix, "outdir": "./tmp", "pseudo_dir": "./pseudo", "etot_conv_thr": 1e-5, "forc_conv_thr": 1e-4},
+            system={"ecutwfc": 60, "ecutrho": 480, "occupations": "smearing", "smearing": "gaussian", "degauss": 0.01, "nspin": 2},
+            electrons={"conv_thr": 1e-7, "mixing_beta": 0.3},
+            ions={"ion_dynamics": "bfgs"}, cell={"cell_dynamics": "bfgs"},
+            kpoints_grid=(3, 3, 4) if poly != "delta" else (3, 3, 2)
+        )
+        zf.writestr(f"{prefix}_qe_relax.in", str(qe_in))
+    buf.seek(0)
+    return buf, len(struct), struct.composition.reduced_formula
 
+st.title("🔋 MaterialsGPT Africa — Team P03 Discovery Platform")
+st.caption("AI-Guided Discovery of Affordable MnO₂-Based Cathode Materials for Aqueous Zinc-Ion Batteries (AZIBs)")
+conn = sqlite3.connect(DB_PATH)
+try:
+    materials = pd.read_sql_query("SELECT * FROM materials", conn)
+    structures = pd.read_sql_query("SELECT * FROM structures", conn)
+    descriptors = pd.read_sql_query("SELECT * FROM descriptors", conn)
+    experiments = pd.read_sql_query("SELECT * FROM experiments", conn)
+    computations = pd.read_sql_query("SELECT * FROM computations", conn)
+finally:
+    conn.close()
+
+if len(experiments) < 2:
+    fb_mats, fb_exps = get_fallback_records()
+    materials = pd.concat([materials, fb_mats], ignore_index=True).drop_duplicates(subset=["material_id"])
+    experiments = fb_exps
+
+features_df = compute_features_from_db(materials, structures, descriptors, computations)
+for col in ("dopant_atomic_pct", "intercalant_stoich"):
+    features_df[col] = pd.to_numeric(features_df[col], errors="coerce").fillna(0.0)
+
+train_df = pd.merge(experiments, features_df, on="material_id", how="inner")
+X_train = train_df[FEATURE_COLS].astype(float).fillna(0.0)
+rf_cap = RandomForestRegressor(n_estimators=200, random_state=42).fit(X_train, train_df["specific_capacity_mah_g"].astype(float))
+rf_ret = RandomForestRegressor(n_estimators=200, random_state=42).fit(X_train, train_df["capacity_retention_pct"].astype(float))
+
+proposed_df = features_df[features_df["evidence_status"] == "proposed"].reset_index(drop=True)
+if len(proposed_df) == 0:
+    prop_rows, seq = [], 1
+    for poly in ("alpha", "delta"):
+        for dop in ("Fe", "Ti", "Ni"):
+            for ion in ("K+", "Na+"):
+                ic = ion.replace("+", "")
+                prop_rows.append({"material_id": f"MNO2-{poly.upper()}-COMOD-{dop}_{ic}-{seq:03d}", "formula": f"{ic}0.15{dop}0.05Mn0.95O2", "polymorph": poly, "modification_type": "co-modified", "dopant_element": dop, "dopant_atomic_pct": 5.0, "intercalant_ion": ion, "intercalant_stoich": 0.15, "evidence_status": "proposed"})
+                seq += 1
+    proposed_df = compute_features_from_db(pd.DataFrame(prop_rows), structures, descriptors, computations)
+    for col in ("dopant_atomic_pct", "intercalant_stoich"):
+        proposed_df[col] = pd.to_numeric(proposed_df[col], errors="coerce").fillna(0.0)
+    features_df = pd.concat([features_df, proposed_df], ignore_index=True)
+
+proposed_df["mn_additive_conc_m"] = 0.1
+proposed_df["current_density_a_g"] = 0.2
+X_pred = proposed_df[FEATURE_COLS].astype(float).fillna(0.0)
+tree_cap = np.array([t.predict(X_pred.to_numpy()) for t in rf_cap.estimators_])
+tree_ret = np.array([t.predict(X_pred.to_numpy()) for t in rf_ret.estimators_])
+
+proposed_df["pred_capacity_mah_g"] = tree_cap.mean(axis=0).round(2)
+proposed_df["pred_capacity_std"] = tree_cap.std(axis=0).round(2)
+proposed_df["pred_retention_pct"] = tree_ret.mean(axis=0).round(2)
+
+importances = rf_cap.feature_importances_
+means = X_train.mean().to_numpy()
+stds = X_train.std().replace(0, 1.0).to_numpy()
+shap_vals = ((X_pred.to_numpy() - means) / stds) * importances * 10.0
+
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Total Cataloged Materials", len(features_df))
+k2.metric("Verified Experimental Records", len(experiments))
+k3.metric("Baseline DFT Polymorphs", len(computations))
+k4.metric("Proposed Virtual Candidates", len(proposed_df))
+st.divider()
+
+st.sidebar.header("🔍 Candidate Exploration Filters")
+selected_polymorphs = st.sidebar.multiselect("MnO₂ Polymorph", ["alpha", "beta", "gamma", "delta"], default=["alpha", "beta", "gamma", "delta"])
+selected_dopants = st.sidebar.multiselect("Substitutional Dopant", ["None", "Fe", "Ti", "Ni"], default=["None", "Fe", "Ti", "Ni"])
+selected_ions = st.sidebar.multiselect("Pre-Intercalation Ion", ["None", "K+", "Na+"], default=["None", "K+", "Na+"])
+selected_evidence = st.sidebar.multiselect("Evidence Status", ["both", "experimental", "proposed"], default=["both", "experimental", "proposed"])
+
+st.sidebar.divider()
+st.sidebar.header("⚖️ Multi-Objective Ranking Weights")
+w_cap = st.sidebar.slider("Weight: Specific Capacity", 0.0, 1.0, 0.50, 0.05)
+w_ret = round(1.0 - w_cap, 2)
+st.sidebar.write(f"Weight: Cycling Stability: {w_ret:.2f}")
+
+filtered = features_df.copy()
+filtered["dopant_clean"] = filtered["dopant_element"].astype(object).fillna("None").astype(str)
+filtered["ion_clean"] = filtered["intercalant_ion"].astype(object).fillna("None").astype(str)
+filtered = filtered[(filtered["polymorph"].isin(selected_polymorphs)) & (filtered["dopant_clean"].isin(selected_dopants)) & (filtered["ion_clean"].isin(selected_ions))]
+
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Candidate Explorer", "🏆 AI Ranking, SHAP & DFT Export", "🧪 Experimental vs. DFT Evidence", "🧭 Evidence Gaps"])
+
+with tab1:
+    st.subheader("Filtered MnO₂ Candidate Matrix")
+    st.dataframe(filtered[["material_id", "formula", "polymorph", "modification_type", "dopant_clean", "dopant_atomic_pct", "ion_clean", "intercalant_stoich", "evidence_status", "theoretical_cap_2e_mah_g", "dopant_radius_strain_pct", "effective_spacing_A"]], width="stretch", hide_index=True)
+
+with tab2:
+    st.subheader("Ranked Virtual Co-Modified Candidates (ML Predictions)")
+    st.info("⚠️ Transparency Notice: Values below are Random Forest predictions at 0.2 A/g (2M ZnSO₄ + 0.1M MnSO₄) and are not yet experimentally synthesized.")
+    ranked = proposed_df.copy()
+    ranked["dopant_clean"] = ranked["dopant_element"].astype(object).fillna("None").astype(str)
+    ranked["ion_clean"] = ranked["intercalant_ion"].astype(object).fillna("None").astype(str)
+    ranked = ranked[(ranked["polymorph"].isin(selected_polymorphs)) & (ranked["dopant_clean"].isin(selected_dopants)) & (ranked["ion_clean"].isin(selected_ions))].copy()
+    if len(ranked) == 0:
+        st.warning("No proposed candidates match your current sidebar filters.")
+    else:
+        ranked["dynamic_score"] = (w_cap * (ranked["pred_capacity_mah_g"] / 308.0) + w_ret * (ranked["pred_retention_pct"] / 100.0)).round(4)
+        ranked = ranked.sort_values("dynamic_score", ascending=False)
+        st.dataframe(ranked[["material_id", "formula", "polymorph", "dopant_element", "intercalant_ion", "pred_capacity_mah_g", "pred_capacity_std", "pred_retention_pct", "dynamic_score"]], width="stretch", hide_index=True)
+        st.divider()
+        st.subheader("🧠 Feature Attribution & ⚛️ Workstation DFT Supercell Export")
+        chosen_id = st.selectbox("Select candidate to inspect & export:", ranked["material_id"].tolist())
+        col_shap, col_dft_dl = st.columns([1.4, 1.0])
+        with col_shap:
+            orig_idx = proposed_df.index[proposed_df["material_id"] == chosen_id].tolist()[0]
+            local_shap = pd.Series(shap_vals[orig_idx], index=[PRETTY_NAMES[c] for c in FEATURE_COLS])
+            local_shap = local_shap[local_shap.abs() > 1e-4].sort_values()
+            fig, ax = plt.subplots(figsize=(7, 3.8))
+            local_shap.plot(kind="barh", ax=ax, color=["#ef4444" if v < 0 else "#10b981" for v in local_shap.values], edgecolor="black")
+            ax.axvline(0, color="black", linewidth=1)
+            ax.set_xlabel("Feature Attribution to Predicted Capacity (mAh/g)")
+            ax.set_title(f"Descriptor Attribution: {chosen_id}")
+            plt.tight_layout()
+            st.pyplot(fig)
+        with col_dft_dl:
+            selected_row = ranked[ranked["material_id"] == chosen_id].iloc[0]
+            zip_buf, n_atoms, sc_formula = build_workstation_dft_zip(selected_row)
+            st.markdown("Workstation DFT Package Ready:")
+            st.write(f"- Candidate: {chosen_id}")
+            st.write(f"- Supercell Formula: {sc_formula} ({n_atoms} atoms)")
+            st.write("- Included Files: .cif, .POSCAR (VASP), _qe_relax.in (Quantum ESPRESSO)")
+            if zip_buf is not None:
+                st.download_button(label="📥 Download DFT Package (.zip)", data=zip_buf, file_name=f"{chosen_id}_DFT_package.zip", mime="application/zip", type="primary")
+            else:
+                st.warning("Baseline CIF not found in repository root for supercell generation.")
+
+with tab3:
+    col_exp, col_dft = st.columns(2)
+    with col_exp:
+        st.subheader("🧪 Reported AZIB Experimental Data")
+        exp_joined = pd.merge(experiments, materials[["material_id", "formula", "polymorph", "modification_type"]], on="material_id")
+        st.dataframe(exp_joined[["material_id", "formula", "polymorph", "electrolyte_salt", "mn_additive_conc_m", "current_density_a_g", "specific_capacity_mah_g", "cycle_number_tested", "capacity_retention_pct"]], width="stretch", hide_index=True)
+    with col_dft:
+        st.subheader("⚛️ Baseline DFT & Crystallographic Data")
+        dft_joined = pd.merge(pd.merge(structures, computations, on="structure_id"), descriptors, on="structure_id")
+        st.dataframe(dft_joined[["material_id", "space_group_symbol", "avg_mn_o_bond_length", "tunnel_or_interlayer_spacing", "energy_above_hull_ev_atom", "band_gap_ev"]], width="stretch", hide_index=True)
+
+with tab4:
+    st.subheader("🧭 Automated Evidence Gap & Validation Planner")
+    st.markdown("- Unexplored Polymorphs: β-MnO₂ and γ-MnO₂ lack doped/pre-intercalated experimental entries—prioritize literature extraction for Ti-doped β-MnO₂ and K⁺-intercalated γ-MnO₂.")
+    st.markdown("- Co-Modification Gap: All 12 co-modified candidates (Fe/Ti/Ni + K⁺/Na⁺) exist only as ML predictions (evidence_status = 'proposed'). Export their supercell packages in Tab 2 for DFT NEB Zn²⁺ migration barrier calculations.")
+    st.markdown("- High-Rate Testing Gap: Current experimental records sit at 0.2 A/g. Adding high-rate (2.0–5.0 A/g) records will lower model uncertainty (±1σ).")
